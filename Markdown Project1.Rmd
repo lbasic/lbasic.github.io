@@ -1,0 +1,256 @@
+---
+title: "Tether Project"
+author: "lbasic"
+date: "July 2018"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE,message = FALSE)
+```
+
+##Background 
+Tether is cryptocurrency token claimed by its creators to be backed by one dollar for each token issued. It was issued on the Bitcoin blockchain through the Omni Layer Protocol and the primary objective is to facilitate transactions between cryptocurrency exchanges with a rate fixed to the United States dollar allowing traders to take advantage of arbitrage opportunities without resorting to bank wires. As of July 2018, Tether is ranked the 8th highest market cap cryptocurrency in the world, with a market cap around $2.7 billion.
+
+##Price manipulation
+Research suggests that a price manipulation scheme involving tether accounted for about half of the price increase in bitcoin in late 2017. (https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3195066)
+
+##Data insert into SQL Server 2017
+The data for the analysis was created using Omnicore node which tracks Tether transactions on the Bitcoin Blockchain. We get huge .csv file with all transactions on the blockchain. We load this .csv file into SQL Server 2017. Then we make needed adjustments to columns including nullability and constraints.
+```{sql, eval=FALSE}
+--alter column _tx_hash_ into non-nullable
+ALTER TABLE dbo.tether_transactions_522647_v3
+ALTER COLUMN _tx_hash_ nvarchar(100) NOT NULL;
+
+--add primary key on table with all transactions on column _tx_hash_
+ALTER TABLE dbo.tether_transactions_522647_v3
+ADD CONSTRAINT pk_tx_hash PRIMARY KEY(_tx_hash_);
+
+--create table with all transactions in 2018
+DROP TABLE IF EXISTS dbo.tether_all_transactions_2018;
+SELECT _block_time_, _sending_address_, _reference_address_,_tx_type_,_amount_
+INTO dbo.tether_all_transactions_2018
+FROM dbo.tether_transactions_522647_v3
+WHERE _block_time_ >='20180101'
+AND _is_valid_=1;
+
+--alter type to float on column _amount_
+ALTER TABLE dbo.tether_all_transactions_2018
+ALTER COLUMN _amount_ FLOAT NOT NULL;
+```
+##Data manipulation in SQL Server 2017
+First we create Inline table-valued user-defined function named TransactionsByDate with 3 parameters: startdate, enddate and minimum transaction volume between two addresses.
+There are thousands of transactions every day and graph would be unreadable if we plotted all transactions so with third parameter we can get clearer picture (by default parameter is set to 500,000 and represents sum of all transactions bettween 2 addresses in a specified time frame)
+
+```{sql, eval=FALSE}
+DROP FUNCTION IF EXISTS dbo.udfTransactionsByDate;
+GO
+CREATE FUNCTION dbo.udfTransactionsByDate(@start AS DATETIME, @end AS DATETIME,@TotalSent AS FLOAT=500000) RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+SELECT _sending_address_, _reference_address_,TotalSent
+FROM(
+  SELECT _sending_address_, _reference_address_, ROUND(SUM(_amount_),0) AS TotalSent
+  FROM dbo.tether_all_transactions_2018
+  WHERE _block_time_>=@start AND _block_time_< @end
+  GROUP BY _sending_address_, _reference_address_) AS A
+WHERE TotalSent>@TotalSent;
+GO
+```
+
+There are many addressess on tether network that are only transitional. For example: tether is sent from exchange A into address B and then same amount is sent to exchange C. We would like to filter out those middle addresses so we get a clearer picture of transaction flow between A and C. To achieve this we create Inline table-valued user-defined function ConnectedTransactionsByDate with the same parameters as previous function.
+
+```{sql, eval=FALSE}
+DROP FUNCTION IF EXISTS dbo.udfConnectedTransactionsByDate;
+GO
+CREATE FUNCTION dbo.udfConnectedTransactionsByDate(@start AS DATETIME, @end AS DATETIME,@TotalSent AS FLOAT=500000) RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+SELECT t2._sending_address_, t2._reference_address_, t1.sa, t1.ra, t1.ts
+FROM
+(SELECT _sending_address_ AS sa, _reference_address_ AS ra, ROUND(SUM(_amount_),0) AS ts
+  FROM dbo.tether_all_transactions_2018
+  WHERE _block_time_>=@start AND _block_time_< @end
+  GROUP BY _sending_address_, _reference_address_) AS t1
+INNER JOIN (SELECT _sending_address_, _reference_address_, ROUND(SUM(_amount_),0) AS TotalSent
+            FROM dbo.tether_all_transactions_2018
+            WHERE _block_time_>=@start AND _block_time_< @end
+            GROUP BY _sending_address_, _reference_address_) AS t2 ON t2._reference_address_=t1.sa AND t1.ts=t2.TotalSent
+WHERE t1.ts>@TotalSent;
+GO
+```
+
+We execute following SQL query to create dataset that will be used in the plot. First we declare @start,@end, @TotalSent, then we create Common Table Expression and we name it CTE. Output contains 3 attributes: SendingAddress, ReceivingAddress, TotalSent.
+
+```{sql, eval=FALSE}
+--get all transactions on certain date, filter out middle address in connected transactions and then group by distinct addresses and sum totalsent
+DECLARE @start AS DATETIME='20180304 00:00:00.000'
+DECLARE @end AS DATETIME='20180306 00:00:00.000'
+DECLARE @TotalSent AS FLOAT=500000;
+
+
+WITH CTE AS(
+  --connected transactions without middle address
+  SELECT _sending_address_ AS SendingAddress,ra AS ReceivingAddress,ts AS TotalSent
+  FROM dbo.udfConnectedTransactionsByDate(@start,@end,@TotalSent)
+  
+  UNION ALL
+  --all transactions between all addresses grouped by distinct addresses between @start and @end, and sum of sent > 500,000usdt, except all connected transactions
+  (SELECT _sending_address_, _reference_address_,TotalSent
+    FROM dbo.udfTransactionsByDate(@start,@end,@TotalSent)
+    WHERE TotalSent>@TotalSent)
+  EXCEPT
+  (SELECT _sending_address_, _reference_address_, ts
+    FROM dbo.udfConnectedTransactionsByDate(@start,@end,@TotalSent)
+    UNION ALL
+    SELECT sa,ra,ts
+    FROM dbo.udfConnectedTransactionsByDate(@start,@end,@TotalSent)))
+SELECT SendingAddress, ReceivingAddress, SUM(TotalSent) AS TotalSent
+FROM CTE
+GROUP BY SendingAddress, ReceivingAddress
+ORDER BY TotalSent DESC;
+```
+
+##Data import into R and manipulation into usable graph object
+
+```{sql,eval=FALSE}
+library(RODBC)
+library(tidyverse)
+library(stringr)
+library(igraph)
+
+#Connect to SQL Server
+conn<-odbcDriverConnect("Driver=SQL Server;Server=DESKTOP-92B083S;Database=Tether;trusted_connection=yes")
+#Import data for date range between 4th March 2018 and 6th March 2018
+data<-sqlQuery(conn,"DECLARE @start AS DATETIME='20180304 00:00:00.000'
+                     DECLARE @end AS DATETIME='20180306 00:00:00.000'
+                     DECLARE @TotalSent AS FLOAT=500000;
+               
+WITH CTE AS(
+ --connected transactions without middle address
+SELECT _sending_address_ AS SendingAddress,ra AS ReceivingAddress,ts AS TotalSent
+FROM dbo.udfConnectedTransactionsByDate(@start,@end,@TotalSent)
+               
+UNION ALL
+--all transactions between all addresses grouped by distinct addresses between @start and @end, and cumulative sent > 500,000usdt, except all connected transactions
+(SELECT _sending_address_, _reference_address_,TotalSent
+ FROM dbo.udfTransactionsByDate(@start,@end,@TotalSent)
+ WHERE TotalSent>@TotalSent)
+ EXCEPT
+   (SELECT _sending_address_, _reference_address_, ts
+    FROM dbo.udfConnectedTransactionsByDate(@start,@end,@TotalSent)
+    UNION ALL
+    SELECT sa,ra,ts
+    FROM dbo.udfConnectedTransactionsByDate(@start,@end,@TotalSent)))
+
+SELECT SendingAddress, ReceivingAddress, SUM(TotalSent) AS TotalSent
+FROM CTE
+GROUP BY SendingAddress, ReceivingAddress
+ORDER BY TotalSent DESC;")
+```
+```{r, eval=FALSE}
+#Convert SendingAddress and ReceivingAddress columns from factor into character type
+data[,1:2]<-sapply(data[,1:2], as.character)
+
+#Import Balances and TetherAddresses
+Balances<-read.csv(file.choose(),header=TRUE)
+TetherAddresses<- read.table("TetherAddress.csv", header=TRUE,sep=",",colClasses=c("character","character"))
+
+#Join data with TetherAddresses, we get 2 new columns ID.x and ID.y
+g<-data %>% left_join(TetherAddresses, by=c("SendingAddress"="TetherAddress"))%>%
+              left_join(TetherAddresses, by=c("ReceivingAddress"="TetherAddress"))
+
+#We mutate 2 new columns with the names of exchanges and <NA>'s replaced with last 3 letters from corresponding address
+g2<-g %>% mutate(SendingAddressID= ifelse(is.na(ID.x), str_sub(SendingAddress,-3),ID.x))%>%
+             mutate(ReceivingAddressID=ifelse(is.na(ID.y),str_sub(ReceivingAddress,-3),ID.y))%>%
+             select(SendingAddressID,ReceivingAddressID,TotalSent)
+
+# We mutate 1 new column RelativeSizOfEdge
+g3<-g2 %>% mutate(RelativeSizeOfEdge=ifelse(TotalSent<10000000,1,ifelse(TotalSent<30000000,4,ifelse(TotalSent<60000000,7,10))))
+
+# Display TotalSent column in millions with 1 decimal point for easier read of the plot
+g3[,"TotalSent"]<-round(g3$TotalSent/1000000,1)
+
+# Create graph object
+p<-graph.data.frame(g3,directed = TRUE)
+
+# Create function to include only 1 edge between 2 nodes instead of 2 reciprocal edges, label should be subtraction of the
+# TotalSent values, direction should be towards node where larger amount of Tether was sent
+nettedGraph <- function(p, col="TotalSent") {
+  if(!(col %in% edge_attr_names(p))) {
+    stop(col, " not an edge attribute")
+  }
+# Get a matrix of mutual edges (by vertex ids)
+me<-ends(p, E(p)[which_mutual(p)], names=FALSE) 
+# Only keep one of the mutual edges
+me<-me[me[,1] <= me[,2],] 
+if(length(me)<3) {me<-t(me)}
+# Create vector for rows to delete
+toDel<-vector(mode="integer",length=nrow(me))
+for (i in 1:nrow(me)) {
+  
+  # Get edge ids going each way
+  e1 <- get.edge.ids(p, c(me[i,1],me[i,2]))       
+  e2 <- get.edge.ids(p, c(me[i,2],me[i,1]))
+  
+  weightDiff<- edge_attr(p,col, e1) - edge_attr(p,col, e2)
+  
+  if(weightDiff >= 0) {
+    # Update the edge we're keeping
+    edge_attr(p,col, e1) <- weightDiff
+    # Delete the one we're not
+    toDel[i] <- e2
+  } else {
+    # Update the edge we're keeping
+    edge_attr(p,col, e2) <- -weightDiff
+    # Delete the one we're not
+    toDel[i] <- e1
+  }
+}
+# Now delete all the unneeded edges
+p <- p - E(p)[toDel]
+
+return(p)
+}
+gNet <- nettedGraph(p)
+```
+
+## Plot interactive network graph
+
+```{r, eval=FALSE}
+tkplot(gNet,
+       edge.label=E(gNet)$TotalSent,
+       edge.arrow.size = 1,
+       edge.width=E(gNet)$RelativeSizeOfEdge,
+       vertex.label=V(gNet)$name,          
+       vertex.label.cex = 1.2,          
+       vertex.color="cadetblue1",       
+       vertex.label.color="black",
+       vertex.label.font=4)
+```
+
+
+![](R/2.png)
+
+##Analysis
+Picture above is just one of many examples when Tether is returned to Bitfinex exchange and soon after Bitcoin price falls substantially. Sometimes these funds are returned to Tether Treasury. Plot was made for 4.3.2018-6.3.2018 and now let's take a look what happened to Bitcoin price:
+
+![](R/Bitcoin1.png)
+
+
+Bitcoin price falls in the comming month from 11700usd to 6500usd, more than 44% decrease in price.
+We run further analysis on days between 3.5.2018 and 7.5.2018 and we can observe the same pattern, tether leaving major exchanges through different channels into Bitfinex exchange and then returned to the Treasury. No such pattern is found when we run analysis on other random days. On the other hand we find some connection between tehter being sent from the Treasury into Bitfinex exchange and then further into other exchanges but there isn't immediate effect so prices could fall further before they find support with these funds.
+Based on all these information we could predict major fall in price of Bitcoin after 24.7.2018. Price fell in the next weeks from 8300usd to 6200usd, or 25% decrease in price. 
+Following picture shows transactions between Tether Treasury and Bitfinex exchange:
+
+![](R/Bitcoin2.png)
+
+So in order to successfully predict in which way the price of Bitcoin is going we analysed the whole tether network and focused on tether leaving major exchanges. For interpretation purpose we tried to simplify the whole process which is in fact very complicated. For example manipulators used thousands of different addresses trying to hide where funds are going, exchanges also have tens of different addresses which had to be identifed.
+On top of that also thousands of Bitcoin addresses from Bitfinex exchange were analysed and were also used for prediction of the price combined with everything we explained before. I would like to finish with following picture which represents all transactions of a certain Bitfinex bitcoin wallet. I would like you to focus on following dates: 20.2.2018, 5.3.2018, 5.5.2018 which are all local tops.5.3.2018 40000 bitcoins were transfered from cold storage into hot wallet of Bitfinex and later sold on all major exchanges. Can anyone still claim that bitcoin is decentralized and not manipulated?
+![](R/Bitcoin3.png)
